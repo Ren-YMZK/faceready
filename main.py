@@ -18,24 +18,19 @@ SHOW_LANDMARKS = True
 BOX_SMOOTH_ALPHA = 0.35
 HIGHLIGHT_WARN_RATIO = 0.01
 
-# ===== Beauty parameters (STRONG but natural) =====
+# ===== Beauty parameters =====
 BEAUTY_DEFAULT_ON = True
-# 1) 処理解像度を下げて高速化（0.6〜0.8が目安、0.5だとさらに高速・画質やや低下）
 ROI_DOWNSCALE = 0.6
-# 2) エッジ保存スムージング（バイラテラル）
-BILATERAL_ITER   = 2         # 繰り返し回数（1〜3）
-BILATERAL_SIG_C  = 38        # sigmaColor（色の平滑）
-BILATERAL_SIG_S  = 7         # sigmaSpace（空間）
-# 3) トーン調整（やや強め）
-CONTRAST_ALPHA = 1.18        # 1.10〜1.25
-BRIGHT_BETA    = 18          # 10〜30
-# 4) CLAHE（明部の伸びすぎ抑制・軽め）
-CLAHE_CLIP = 1.6             # 1.2〜2.0
-# 5) 合成
-BLEND_ALPHA = 0.52           # 0.45〜0.60（高いほど強い）
+BILATERAL_ITER   = 2
+BILATERAL_SIG_C  = 38
+BILATERAL_SIG_S  = 7
+CONTRAST_ALPHA = 1.18
+BRIGHT_BETA    = 18
+CLAHE_CLIP = 1.6
+BLEND_ALPHA = 0.52
 ELLIPSE_MARGIN = 0.10
 FEATHER_PX = 25
-EDGE_PROTECT_WEIGHT = 0.35   # 輪郭部分は処理を弱める（0.0で無効、0.2〜0.5）
+EDGE_PROTECT_WEIGHT = 0.35
 
 # =========================
 # Utils
@@ -96,20 +91,17 @@ def make_ellipse_mask(h, w, rect, margin=0.10, feather=25):
     return mask
 
 def edge_protect_mask(bgr, rect, feather=7):
-    """輪郭で処理を弱めるための0..1マスク（1=処理強、エッジは小さく）"""
     h, w = bgr.shape[:2]
     x1, y1, x2, y2 = [max(0, v) for v in map(int, rect)]
     x2 = min(w, x2); y2 = min(h, y2)
     if x2 <= x1 or y2 <= y1:
         return np.ones((h, w), dtype=np.float32)
 
-    # 顔周辺のエッジを検出（Canny）
     gray = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 60, 120)
     edges = cv2.GaussianBlur(edges, (0, 0), feather)
-    edges = edges.astype(np.float32) / 255.0  # 0..1（1=強いエッジ）
+    edges = edges.astype(np.float32) / 255.0
 
-    # 1 - w*edges でエッジ周辺は処理弱め
     protect = 1.0 - EDGE_PROTECT_WEIGHT * edges
     protect = np.clip(protect, 0.0, 1.0)
 
@@ -118,13 +110,6 @@ def edge_protect_mask(bgr, rect, feather=7):
     return full
 
 def apply_edge_preserving_beauty(bgr, rect):
-    """
-    顔矩形ベースのエッジ保存・高速美顔
-    - ROIを縮小してバイラテラル(反復) → 拡大
-    - CLAHE(軽) + コントラスト/明るさ
-    - 輪郭部は処理を弱める（edge_protect）
-    - 楕円マスクで合成
-    """
     h, w = bgr.shape[:2]
     x1, y1, x2, y2 = [max(0, v) for v in map(int, rect)]
     x2 = min(w, x2); y2 = min(h, y2)
@@ -132,8 +117,6 @@ def apply_edge_preserving_beauty(bgr, rect):
         return bgr
 
     roi = bgr[y1:y2, x1:x2].copy()
-
-    # ダウンサンプリング（高速化＆モザイク感の抑制のバランス）
     if ROI_DOWNSCALE < 1.0:
         small_size = (max(1, int(roi.shape[1] * ROI_DOWNSCALE)),
                       max(1, int(roi.shape[0] * ROI_DOWNSCALE)))
@@ -141,15 +124,12 @@ def apply_edge_preserving_beauty(bgr, rect):
     else:
         proc = roi
 
-    # エッジ保持スムージング（バイラテラル複数回）
     for _ in range(max(1, BILATERAL_ITER)):
         proc = cv2.bilateralFilter(proc, d=0, sigmaColor=BILATERAL_SIG_C, sigmaSpace=BILATERAL_SIG_S)
 
-    # 元サイズへ戻す
     if proc.shape[:2] != roi.shape[:2]:
         proc = cv2.resize(proc, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-    # CLAHE（軽め）＋ コントラスト/明るさ
     lab = cv2.cvtColor(proc, cv2.COLOR_BGR2Lab)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(8, 8))
@@ -158,20 +138,14 @@ def apply_edge_preserving_beauty(bgr, rect):
     enhanced = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
     enhanced = cv2.convertScaleAbs(enhanced, alpha=CONTRAST_ALPHA, beta=BRIGHT_BETA)
 
-    # ROIとブレンド（処理の“強さ”）
     blended = cv2.addWeighted(enhanced, BLEND_ALPHA, roi, 1.0 - BLEND_ALPHA, 0)
 
-    # フルキャンバスへ
     canvas = bgr.copy()
     canvas[y1:y2, x1:x2] = blended
 
-    # 楕円マスク
     mask = make_ellipse_mask(h, w, (x1, y1, x2, y2), margin=ELLIPSE_MARGIN, feather=FEATHER_PX).astype(np.float32) / 255.0
-
-    # 輪郭保護マスク（エッジ付近の処理を弱める）
     protect = edge_protect_mask(bgr, (x1, y1, x2, y2))
     mask *= protect
-
     mask3 = cv2.merge([mask, mask, mask])
 
     out = (bgr.astype(np.float32) * (1.0 - mask3) +
@@ -190,7 +164,7 @@ def main():
         model=str(MODEL_PATH),
         config="",
         input_size=(320, 320),
-        score_threshold=0.9,   # 誤検出を減らす
+        score_threshold=0.9,
         nms_threshold=0.3,
         top_k=5000
     )
@@ -294,7 +268,7 @@ def main():
             info_lines.append(f"Highlight warn: {pct:.2f}% near 255")
 
         overlay_text(disp, help_lines + info_lines, pos=(10, 25))
-        cv2.imshow("Face Ready - Phase 3 (Edge-preserving beauty)", disp)
+        cv2.imshow("Face Ready - YuNet + Beauty", disp)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
