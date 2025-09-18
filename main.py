@@ -1,34 +1,33 @@
 import sys
 import time
 from collections import deque
+from pathlib import Path
+from typing import List, Tuple
+
 import cv2
 import numpy as np
 
-# ========= User-tunable defaults =========
-PREFERRED_RES = [(1280, 720), (960, 540), (640, 360)]  # press 'r' to cycle
+# =========================
+# Config
+# =========================
+# ダウンロードした YuNet モデルのパス
+MODEL_PATH = Path("models/face_detection_yunet_2023mar.onnx")
+
+# 解像度プリセット（rキーで切替）
+PREFERRED_RES = [(1280, 720), (960, 540), (640, 360)]
 TARGET_FPS = 30
-FLIP_HORIZONTAL_DEFAULT = True  # mirror view for self-portrait
-HIGHLIGHT_WARN_RATIO = 0.01     # warn if top 1% pixels are saturated
+FLIP_HORIZONTAL_DEFAULT = True
 
-# ========= Utils =========
-def try_open(index: int, width: int, height: int, fps: int):
-    """Try opening a camera using Media Foundation (MSMF) for Windows stability."""
-    cap = cv2.VideoCapture(index, cv2.CAP_MSMF)
-    if not cap.isOpened():
-        return None
-    # Request properties (may not be honored by all devices)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS,          fps)
+# 描画や平滑化のパラメータ
+BOX_SMOOTH_ALPHA = 0.35      # 枠の指数移動平均（0=追従速い, 1=全く更新しない わけではない点に注意）
+SHOW_LANDMARKS = True        # YuNetは目・鼻・口角の5点を返す
+HIGHLIGHT_WARN_RATIO = 0.01  # 飽和ピクセル（255）の割合が1%超で警告
 
-    ok, _ = cap.read()
-    if not ok:
-        cap.release()
-        return None
-    return cap
-
+# =========================
+# Utils
+# =========================
 def enumerate_devices(max_index: int = 5):
-    """Lightweight probe for available device indices using MSMF."""
+    """MSMFで0..max_indexを走査して利用可能なデバイス番号を返す"""
     found = []
     for i in range(max_index + 1):
         cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
@@ -39,44 +38,69 @@ def enumerate_devices(max_index: int = 5):
         cap.release()
     return found
 
+def try_open(index: int, width: int, height: int, fps: int):
+    """指定デバイスをMSMFでオープン（1フレーム読めたらcapを返す）"""
+    cap = cv2.VideoCapture(index, cv2.CAP_MSMF)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS,          fps)
+    ok, _ = cap.read()
+    if not ok:
+        cap.release()
+        return None
+    return cap
+
 def overlay_text(img, lines, pos=(10, 25)):
     x, y = pos
     for line in lines:
-        cv2.putText(img, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, line, (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
         y += 20
 
 def highlight_warnings(bgr, ratio_threshold=0.01):
-    """Return (warn_flag, percent_saturated) based on grayscale histogram."""
+    """白飛び簡易検出（グレイ255近傍の画素割合で判定）"""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    # Count saturated pixels (255)
-    sat = (gray >= 250).sum()
-    total = gray.size
-    pct = sat / max(1, total)
+    pct = float((gray >= 250).sum()) / float(gray.size)
     return (pct >= ratio_threshold, pct * 100.0)
 
-# ========= Main =========
+# =========================
+# Main
+# =========================
 def main():
-    # arg: python capture_preview_en.py [device_index]
-    device_index = None
+    if not MODEL_PATH.exists():
+        print(f"[ERROR] Model not found: {MODEL_PATH.resolve()}")
+        print("→ models フォルダに face_detection_yunet_2023mar.onnx を配置してください。")
+        return
+
+    # YuNet のフェイスディテクタ作成
+    # 注意: 入力サイズは毎回 setInputSize で現在のフレーム解像度を渡す必要がある
+    detector = cv2.FaceDetectorYN_create(
+        model=str(MODEL_PATH),
+        config="",                # 使用しない
+        input_size=(320, 320),    # 仮（後で実際のフレームサイズに更新）
+        score_threshold=0.8,
+        nms_threshold=0.3,
+        top_k=5000
+    )
+
+    # カメラ選択
     if len(sys.argv) >= 2:
         try:
             device_index = int(sys.argv[1])
         except ValueError:
-            print("device_index must be an integer, e.g., python capture_preview_en.py 0")
+            print("device_index must be integer. e.g., python main.py 0")
             return
-
-    # enumerate devices if not specified
-    if device_index is None:
-        candidates = enumerate_devices(5)
-        if not candidates:
-            print("No camera found. Check USB connection or if another app is using it.")
-            return
-        device_index = candidates[0]
-        print(f"[INFO] Candidates: {candidates} -> use: {device_index}")
     else:
-        print(f"[INFO] device index={device_index}")
+        cands = enumerate_devices(5)
+        if not cands:
+            print("No camera found. Close other apps using the camera and try again.")
+            return
+        device_index = cands[0]
+        print(f"[INFO] Candidates: {cands} -> use: {device_index}")
 
-    # open with first workable resolution
+    # カメラ開始
     res_idx = 0
     width, height = PREFERRED_RES[res_idx]
     flip = FLIP_HORIZONTAL_DEFAULT
@@ -89,17 +113,20 @@ def main():
                 width, height = w, h
                 break
     if cap is None:
-        print("Failed to initialize camera. Check permissions or close other apps using it.")
+        print("Failed to initialize camera. Check permission or other apps using it.")
         return
 
-    print(f"[INFO] Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} / Target FPS: {TARGET_FPS}")
+    # 入力サイズを実フレームに合わせる
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    detector.setInputSize((actual_w, actual_h))
+    print(f"[INFO] Resolution: {actual_w}x{actual_h} / Target FPS: {TARGET_FPS}")
 
+    # 計測
     ts_hist = deque(maxlen=60)
-    frame_count, last_report = 0, time.time()
+    smoothed_box = None  # [x1,y1,x2,y2]
 
-    help_lines = [
-        "Keys: ESC=Exit  m=Mirror ON/OFF  r=Resolution cycle",
-    ]
+    help_lines = ["Keys: ESC=Exit  m=Mirror ON/OFF  r=Resolution cycle"]
 
     while True:
         t0 = time.time()
@@ -107,36 +134,63 @@ def main():
         if not ok:
             print("[WARN] Failed to grab frame. Trying to continue...")
             continue
-
         if flip:
             frame = cv2.flip(frame, 1)
 
-        warn, pct = highlight_warnings(frame, HIGHLIGHT_WARN_RATIO)
+        # YuNet 推論
+        # detect の返り値: (retval, faces)
+        # faces: Nx15 [x, y, w, h, score, l_eye(x,y), r_eye(x,y), nose(x,y), l_mouth(x,y), r_mouth(x,y)]
+        retval, faces = detector.detect(frame)
+
+        # もっともスコアの高い顔を選択
+        best = None
+        if faces is not None and len(faces) > 0:
+            faces = faces[np.argsort(faces[:, 4])[::-1]]  # score で降順
+            best = faces[0]
+
+        # 平滑化（指数移動平均）
+        if best is not None:
+            x, y, w, h = best[:4]
+            box = np.array([x, y, x + w, y + h], dtype=np.float32)
+            if smoothed_box is None:
+                smoothed_box = box
+            else:
+                smoothed_box = BOX_SMOOTH_ALPHA * smoothed_box + (1.0 - BOX_SMOOTH_ALPHA) * box
+        else:
+            smoothed_box = None
+
+        # 表示
+        disp = frame.copy()
+        warn, pct = highlight_warnings(disp, HIGHLIGHT_WARN_RATIO)
+        if smoothed_box is not None:
+            x1, y1, x2, y2 = [int(v) for v in smoothed_box]
+            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 220, 255), 2)
+
+        # 5点ランドマーク（任意）
+        if SHOW_LANDMARKS and best is not None:
+            l_eye = tuple(best[5:7].astype(int))
+            r_eye = tuple(best[7:9].astype(int))
+            nose  = tuple(best[9:11].astype(int))
+            l_m   = tuple(best[11:13].astype(int))
+            r_m   = tuple(best[13:15].astype(int))
+            for p in [l_eye, r_eye, nose, l_m, r_m]:
+                cv2.circle(disp, p, 2, (0, 255, 0), -1, cv2.LINE_AA)
 
         t1 = time.time()
         ts_hist.append(t1 - t0)
-        avg_proc_ms = (sum(ts_hist) / max(1, len(ts_hist))) * 1000.0
+        avg_ms = (sum(ts_hist) / max(1, len(ts_hist))) * 1000.0
 
-        info = [
+        info_lines = [
             f"Device: {device_index}",
-            f"Res: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
-            f"Avg Proc: {avg_proc_ms:.1f} ms",
+            f"Res: {actual_w}x{actual_h}",
+            f"Avg Proc: {avg_ms:.1f} ms",
             f"Flip: {'ON' if flip else 'OFF'}",
         ]
         if warn:
-            info.append(f"Highlight warn: {pct:.2f}% pixels near 255")
+            info_lines.append(f"Highlight warn: {pct:.2f}% pixels near 255")
 
-        disp = frame.copy()
-        overlay_text(disp, help_lines + info, pos=(10, 25))
-
-        cv2.imshow("Preview (Phase 1.1 - MSMF)", disp)
-        frame_count += 1
-
-        now = time.time()
-        if now - last_report >= 60:
-            print(f"[INFO] Approx FPS: {frame_count / (now - last_report):.1f}")
-            frame_count = 0
-            last_report = now
+        overlay_text(disp, help_lines + info_lines, pos=(10, 25))
+        cv2.imshow("Face Ready - Phase 2 (YuNet)", disp)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC
@@ -144,19 +198,23 @@ def main():
         elif key in (ord('m'), ord('M')):
             flip = not flip
         elif key in (ord('r'), ord('R')):
+            # 解像度切替：キャプチャを作り直し、YuNet入力サイズも更新
             res_idx = (res_idx + 1) % len(PREFERRED_RES)
             w, h = PREFERRED_RES[res_idx]
             print(f"[INFO] Request resolution -> {w}x{h}")
             cap.release()
             cap = try_open(device_index, w, h, TARGET_FPS)
             if cap is None:
-                print("[WARN] Resolution not supported. Reverting.")
+                print("[WARN] Unsupported. Reverting.")
                 res_idx = (res_idx - 1) % len(PREFERRED_RES)
                 w, h = PREFERRED_RES[res_idx]
                 cap = try_open(device_index, w, h, TARGET_FPS)
                 if cap is None:
-                    print("[ERROR] Re-init failed. Exiting.")
-                    break
+                    print("[ERROR] Re-init failed."); break
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            detector.setInputSize((actual_w, actual_h))
+            smoothed_box = None  # リセット
 
     cap.release()
     cv2.destroyAllWindows()
